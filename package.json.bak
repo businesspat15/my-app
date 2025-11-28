@@ -1,0 +1,16 @@
+﻿{
+    "version":  "1.0.0",
+    "name":  "ceo-toto-tycoon",
+    "scripts":  {
+                    "preview":  "vite preview",
+                    "build":  "vite build",
+                    "dev":  "vite"
+                },
+    "devDependencies":  {
+
+                        },
+    "dependencies":  {
+
+                     },
+    "private":  true
+}
