@@ -28,3 +28,26 @@ drop trigger if exists set_updated_at on public.users;
 create trigger set_updated_at
   before insert or update on public.users
   for each row execute function public.update_timestamp();
+
+
+create or replace function public.handle_referral(
+  p_new_user_id text,
+  p_new_username text,
+  p_referred_by text
+)
+returns void language plpgsql as $$
+declare
+  v_referrer_id text;
+begin
+  insert into public.users(id, username, coins, businesses, level, last_mine, referred_by, referrals_count, subscribed, language_code)
+  values (p_new_user_id, p_new_username, 0, '{}'::jsonb, 1, 0, p_referred_by, 0, false, 'en')
+  on conflict (id) do update set username = excluded.username;
+
+  if p_referred_by is not null and p_referred_by <> '' then
+    v_referrer_id := regexp_replace(p_referred_by, '^ref_', '');
+    update public.users set referrals_count = referrals_count + 1, coins = coins + 100 where id = v_referrer_id;
+    update public.users set coins = coins + 50 where id = p_new_user_id;
+  end if;
+end;
+$$;
+

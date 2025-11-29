@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react'; 
 import { UserState, Tab } from './types';
 import { BUSINESSES, MINE_COOLDOWN_MS } from './constants';
 import BottomNav from './components/BottomNav';
@@ -10,7 +10,7 @@ import MeView from './views/MeView';
 import { calculatePassiveIncome } from './services/gameLogic';
 import { api } from './services/api';
 
-// Default guest user for browser testing
+// Default guest user
 const DEFAULT_GUEST: UserState = {
   id: 'guest_123',
   username: 'Guest CEO',
@@ -27,59 +27,47 @@ const DEFAULT_GUEST: UserState = {
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>(Tab.MINE);
   const [isLoaded, setIsLoaded] = useState(false);
-  
-  // User state
   const [user, setUser] = useState<UserState>(DEFAULT_GUEST);
 
-  // Initialize Telegram Web App and Fetch Data
+  // Telegram Web App init
   useEffect(() => {
     const initApp = async () => {
-      // Check if running inside Telegram
-      if (window.Telegram?.WebApp) {
-        const tg = window.Telegram.WebApp;
+      const tg = window.Telegram?.WebApp;
+      if (tg) {
         tg.ready();
         tg.expand();
-        tg.setHeaderColor('#0f172a'); // Match slate-900 background
+        tg.setHeaderColor('#0f172a');
 
-        // Retrieve user data from Telegram Web App
         const tgUser = tg.initDataUnsafe?.user;
-        
+
         if (tgUser) {
           const userId = String(tgUser.id);
-          
-          // Fetch user from Backend
           const remoteUser = await api.getUser(userId);
-          
-          let currentUser: UserState;
 
+          let currentUser: UserState;
           if (remoteUser) {
-            // Merge remote data with fresh Telegram data (e.g. username updates)
             currentUser = {
               ...remoteUser,
-              id: userId, // Ensure ID matches
+              id: userId,
               username: tgUser.username || tgUser.first_name || 'CEO',
               languageCode: tgUser.language_code || 'en'
             };
           } else {
-            // New User Initialization
             currentUser = {
               ...DEFAULT_GUEST,
               id: userId,
               username: tgUser.username || tgUser.first_name || 'CEO',
               languageCode: tgUser.language_code || 'en',
-              referredBy: tg.initDataUnsafe.start_param || null, 
+              referredBy: tg.initDataUnsafe?.start_param || null,
             };
-            // Immediately save new user to backend
             await api.saveUser(currentUser);
           }
-          
+
           setUser(currentUser);
         } else {
-          // Fallback if no TG user data (e.g., opened via direct link without TG context)
           console.warn("No Telegram user data found.");
         }
       } else {
-        // Fallback for browser testing
         console.log("Running in browser mode");
       }
       setIsLoaded(true);
@@ -88,47 +76,36 @@ const App: React.FC = () => {
     initApp();
   }, []);
 
-  // Persist User State to Backend with Debounce
-  // We use a ref to track if it's the initial load to avoid saving immediately on mount
   const isFirstRender = useRef(true);
 
+  // Persist user changes with debounce
   useEffect(() => {
     if (isFirstRender.current) {
       isFirstRender.current = false;
       return;
     }
-    
     if (!isLoaded) return;
 
-    // Debounce the save operation to avoid spamming the API
     const handler = setTimeout(() => {
       api.saveUser(user);
-    }, 1000); // Wait 1 second after last change
+    }, 1000);
 
-    return () => {
-      clearTimeout(handler);
-    };
+    return () => clearTimeout(handler);
   }, [user, isLoaded]);
 
-  // Handle Mining Action
   const handleMine = () => {
     const now = Date.now();
-    // Simple client-side validation
     if (now - user.lastMine < MINE_COOLDOWN_MS) return;
 
-    // Logic: earn random 2-3 coins + passive
-    const earned = Math.floor(Math.random() * 1) + 1; 
+    const earned = Math.floor(Math.random() * 1) + 1; // 2–3 coins
     const passive = calculatePassiveIncome(user.businesses);
-    const newCoins = user.coins + earned + passive;
-
     setUser(prev => ({
       ...prev,
-      coins: newCoins,
+      coins: prev.coins + earned + passive,
       lastMine: now
     }));
   };
 
-  // Handle Buying Businesses
   const handleBuyBusiness = (businessId: string) => {
     const business = BUSINESSES.find(b => b.id === businessId);
     if (!business) return;
@@ -178,13 +155,8 @@ const App: React.FC = () => {
 
   return (
     <div className="relative w-full h-screen bg-slate-900 text-white font-sans overflow-hidden">
-        {/* Main Content Area */}
-        <div className="h-full w-full">
-            {renderContent()}
-        </div>
-
-        {/* Bottom Navigation */}
-        <BottomNav currentTab={activeTab} onTabChange={setActiveTab} />
+      <div className="h-full w-full">{renderContent()}</div>
+      <BottomNav currentTab={activeTab} onTabChange={setActiveTab} />
     </div>
   );
 };
