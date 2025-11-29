@@ -7,7 +7,7 @@ interface TeamViewProps {
 }
 
 const TeamView: React.FC<TeamViewProps> = ({ user }) => {
-  const referralLink = `https://t.me/CEOTotoBot?start=ref_${user.id}`;
+  const referralLink = `https://t.me/Mine_cifcitotobot?start=ref_${user.id}`;
   
   const handleCopy = () => {
      navigator.clipboard.writeText(referralLink);

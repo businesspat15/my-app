@@ -1,5 +1,46 @@
+// services/api.ts
 import { UserState } from '../types';
 import { supabase } from './supabaseClient';
+
+/**
+ * Helper: safe localStorage set/get (guards for SSR and errors)
+ */
+const safeSetLocal = (key: string, value: string) => {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(key, value);
+    }
+  } catch (e) {
+    // ignore localStorage errors
+    // console.warn('localStorage set failed', e);
+  }
+};
+
+const safeGetLocal = (key: string): string | null => {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return window.localStorage.getItem(key);
+    }
+  } catch (e) {
+    // console.warn('localStorage get failed', e);
+  }
+  return null;
+};
+
+const mapDbToUser = (data: any): UserState => {
+  return {
+    id: String(data.id),
+    username: data.username ?? 'CEO',
+    coins: Number(data.coins ?? 0),
+    businesses: data.businesses ?? {},
+    level: Number(data.level ?? 1),
+    lastMine: Number(data.last_mine ?? 0),
+    referredBy: data.referred_by ?? null,
+    referralsCount: Number(data.referrals_count ?? 0),
+    subscribed: Boolean(data.subscribed ?? false),
+    languageCode: data.language_code ?? 'en',
+  };
+};
 
 export const api = {
   /**
@@ -7,75 +48,63 @@ export const api = {
    * Falls back to localStorage if offline or credentials missing.
    */
   getUser: async (telegramId: string): Promise<UserState | null> => {
-    // Check if Supabase is initialized
+    // 1) Try Supabase if initialized
     if (supabase) {
       try {
-        // Fetch from Supabase
         const { data, error } = await supabase
           .from('users')
           .select('*')
           .eq('id', telegramId)
           .single();
 
-        if (error && error.code !== 'PGRST116') { // PGRST116 is "Row not found"
-          throw error;
+        // If supabase returned an error other than "row not found", log it
+        if (error && (error as any).code !== 'PGRST116') {
+          console.warn('Supabase getUser error:', error);
         }
 
         if (data) {
-          // Map DB snake_case to Frontend camelCase
-          const mappedUser: UserState = {
-            id: data.id,
-            username: data.username,
-            coins: data.coins,
-            businesses: data.businesses || {},
-            level: data.level,
-            lastMine: data.last_mine,
-            referredBy: data.referred_by,
-            referralsCount: data.referrals_count,
-            subscribed: data.subscribed,
-            languageCode: data.language_code
-          };
-
-          // Update local cache
-          localStorage.setItem(`user_${telegramId}`, JSON.stringify(mappedUser));
-          return mappedUser;
+          const mapped = mapDbToUser(data);
+          safeSetLocal(`user_${telegramId}`, JSON.stringify(mapped));
+          return mapped;
         }
-      } catch (error) {
-        console.warn('Supabase fetch failed/offline, checking local cache:', error);
+      } catch (err) {
+        console.warn('Supabase fetch failed / offline, falling back to local cache:', err);
       }
     } else {
-      console.log('Supabase not configured, using local cache.');
+      // Supabase client not configured
+      // console.log('Supabase not configured, checking local cache');
     }
 
-    // Fallback: Try to load from local storage
-    const cached = localStorage.getItem(`user_${telegramId}`);
+    // 2) Fallback to localStorage
+    const cached = safeGetLocal(`user_${telegramId}`);
     if (cached) {
       try {
-        return JSON.parse(cached);
+        const parsed = JSON.parse(cached);
+        return parsed as UserState;
       } catch (e) {
         console.error('Error parsing cached user:', e);
       }
     }
-    
+
     return null;
   },
 
   /**
    * Saves or updates the user data to Supabase.
-   * Always saves to localStorage to ensure data safety.
+   * Always saves to localStorage to ensure data safety / optimistic UI.
+   * Returns the saved DB row when available.
    */
-  saveUser: async (user: UserState): Promise<void> => {
-    // 1. Always save to local storage immediately (Optimistic Save)
+  saveUser: async (user: UserState): Promise<UserState | null> => {
+    // 1) Optimistic local save
     try {
-      localStorage.setItem(`user_${user.id}`, JSON.stringify(user));
+      safeSetLocal(`user_${user.id}`, JSON.stringify(user));
     } catch (e) {
       console.error('Local storage save failed:', e);
     }
 
-    // 2. Sync with Supabase if available
+    // 2) Sync with Supabase if available
     if (supabase) {
       try {
-        // Map Frontend camelCase to DB snake_case
         const dbPayload = {
           id: user.id,
           username: user.username,
@@ -89,16 +118,31 @@ export const api = {
           language_code: user.languageCode
         };
 
-        const { error } = await supabase
+        // Use upsert to create or update
+        // request returning row to confirm saved state
+        const { data, error } = await supabase
           .from('users')
-          .upsert(dbPayload, { onConflict: 'id' });
+          .upsert(dbPayload, { onConflict: 'id' })
+          .select()
+          .single();
 
         if (error) {
-          throw error;
+          console.warn('Supabase upsert error (saved locally):', error);
+          return null;
+        }
+
+        if (data) {
+          const mapped = mapDbToUser(data);
+          // refresh local cache with authoritative row
+          safeSetLocal(`user_${user.id}`, JSON.stringify(mapped));
+          return mapped;
         }
       } catch (error) {
         console.warn('Supabase sync failed (saved locally):', error);
       }
     }
+
+    // If we couldn't sync, return optimistic local copy
+    return user;
   }
 };

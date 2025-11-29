@@ -1,110 +1,104 @@
-// api/register.ts (Vercel serverless)
-// npm packages needed: @supabase/supabase-js (already installed)
+// api/register.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 
-// envs (server-only)
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const BOT_TOKEN = process.env.BOT_TOKEN!; // Telegram bot token
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const BOT_TOKEN = process.env.BOT_TOKEN;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('Missing supabase server envs');
+  console.error('Missing Supabase server envs (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)');
 }
 if (!BOT_TOKEN) {
-  console.error('Missing BOT_TOKEN');
+  console.warn('BOT_TOKEN missing: Telegram initData verification will be skipped if absent.');
 }
 
-const serverClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const serverClient = createClient(SUPABASE_URL!, SUPABASE_SERVICE_ROLE_KEY!);
 
-/** Verify Telegram initData string against bot token */
+// verifies telegram initData string according to Telegram docs (sha256 HMAC)
 function verifyInitData(initData: string, botToken: string): boolean {
-  // Parse query-string style string into entries
-  // e.g. "user={...}&auth_date=...&hash=..."
-  const params = new URLSearchParams(initData);
-  const hash = params.get('hash') || '';
-  if (!hash) return false;
+  try {
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash') || '';
+    if (!hash) return false;
 
-  // Build data_check_string: all other keys sorted alphabetically as key=value, joined by '\n'
-  const entries: string[] = [];
-  for (const [k, v] of params.entries()) {
-    if (k === 'hash') continue;
-    // For object-like values (JSON) we keep the raw value string
-    entries.push(`${k}=${v}`);
+    const entries: string[] = [];
+    for (const [k, v] of params.entries()) {
+      if (k === 'hash') continue;
+      entries.push(`${k}=${v}`);
+    }
+    entries.sort();
+    const dataCheckString = entries.join('\n');
+
+    const secretKey = crypto.createHash('sha256').update(botToken).digest();
+    const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+    return crypto.timingSafeEqual(Buffer.from(hmac, 'hex'), Buffer.from(hash, 'hex'));
+  } catch (err) {
+    console.warn('verifyInitData failed', err);
+    return false;
   }
-  entries.sort(); // alphabetical
-  const dataCheckString = entries.join('\n');
-
-  // Secret key: SHA256(bot_token) (binary)
-  const secretKey = crypto.createHash('sha256').update(botToken).digest();
-
-  // HMAC-SHA256 of dataCheckString using secretKey
-  const hmac = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-
-  // Compare (timing-safe)
-  return crypto.timingSafeEqual(Buffer.from(hmac, 'hex'), Buffer.from(hash, 'hex'));
 }
 
-/** Optional: notify referrer via bot */
 async function notifyReferrer(referrerId: string, message: string) {
+  if (!BOT_TOKEN) return;
   try {
-    const botUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-    await fetch(botUrl, {
+    const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: referrerId,
-        text: message
-      })
+      body: JSON.stringify({ chat_id: referrerId, text: message })
     });
-  } catch (err) {
-    console.warn('notifyReferrer failed', err);
+    return resp.ok;
+  } catch (e) {
+    console.warn('notifyReferrer failed', e);
+    return false;
   }
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
-  const body = req.body || {};
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { initData, id, username, referredBy, languageCode } = body;
+  const { id, username, referredBy, initData, languageCode } = req.body || {};
+
   if (!id || !username) return res.status(400).json({ error: 'Missing id or username' });
 
-  // 1) Optional initData verification (recommended)
-  if (initData) {
+  // Verify initData if provided and BOT_TOKEN present
+  if (initData && BOT_TOKEN) {
     const ok = verifyInitData(initData, BOT_TOKEN);
     if (!ok) {
-      return res.status(401).json({ error: 'Invalid initData (failed signature)' });
+      return res.status(401).json({ error: 'Invalid Telegram initData' });
     }
   }
 
   try {
-    // 2) Call Supabase RPC function handle_referral to create user and credit referrer atomically
-    const rpcArgs = {
+    // Normalize referral: ensure "ref_<id>" or just id -> pass to RPC as provided (RPC strips 'ref_' prefix)
+    const refValue = referredBy ?? null;
+
+    // Call RPC handle_referral
+    const { data, error } = await serverClient.rpc('handle_referral', {
       p_new_user_id: id,
       p_new_username: username,
-      p_referred_by: referredBy || null
-    };
-
-    const { data, error } = await serverClient.rpc('handle_referral', rpcArgs);
+      p_referred_by: refValue
+    });
 
     if (error) {
-      console.error('RPC error', error);
+      console.error('RPC handle_referral error', error);
       return res.status(500).json({ error: error.message || error });
     }
 
-    // 3) Optionally notify the referrer that they earned a bonus
+    // Optionally notify the referrer (only if referredBy present and numeric-ish)
     if (referredBy) {
-      // expected format: "ref_<referrerId>"
-      const ref = referredBy.replace(/^ref_/, '');
+      // strip prefix ref_ if exists for chat id
+      const refId = String(referredBy).replace(/^ref_/, '');
       try {
-        await notifyReferrer(ref, `🎉 You just got a referral! +100 coins (from ${username}).`);
+        await notifyReferrer(refId, `🎉 You earned a referral bonus! (+100 coins)`);
       } catch (e) {
         console.warn('notifyReferrer error', e);
       }
     }
 
-    return res.status(200).json({ ok: true, data });
+    return res.status(200).json({ ok: true, result: data });
   } catch (err) {
     console.error('register error', err);
     return res.status(500).json({ error: String(err) });

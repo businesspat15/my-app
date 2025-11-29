@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'; 
+import React, { useState, useEffect, useRef } from 'react';
 import { UserState, Tab } from './types';
 import { BUSINESSES, MINE_COOLDOWN_MS } from './constants';
 import BottomNav from './components/BottomNav';
@@ -24,52 +24,131 @@ const DEFAULT_GUEST: UserState = {
   languageCode: 'en',
 };
 
+/** Normalize referral param into "ref_<id>" or null */
+const normalizeReferralParam = (raw?: string | null): string | null => {
+  if (!raw) return null;
+  const val = raw.toString().trim();
+  if (!val) return null;
+  if (val.startsWith('ref_')) return val;
+  if (/^\d+$/.test(val)) return `ref_${val}`;
+  return val;
+};
+
+const readReferralFromUrl = (): string | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get('start') ?? params.get('startapp');
+    return normalizeReferralParam(raw);
+  } catch {
+    return null;
+  }
+};
+
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>(Tab.MINE);
   const [isLoaded, setIsLoaded] = useState(false);
   const [user, setUser] = useState<UserState>(DEFAULT_GUEST);
 
-  // Telegram Web App init
   useEffect(() => {
     const initApp = async () => {
-      const tg = window.Telegram?.WebApp;
+      const tg = (window as any).Telegram?.WebApp;
+      let referralFromTelegram: string | null = null;
+
       if (tg) {
-        tg.ready();
-        tg.expand();
-        tg.setHeaderColor('#0f172a');
+        try {
+          tg.ready?.();
+          if (typeof tg.expand === 'function') tg.expand();
+          if (typeof tg.setHeaderColor === 'function') tg.setHeaderColor('#0f172a');
 
-        const tgUser = tg.initDataUnsafe?.user;
+          // Telegram deep-link param (start_param / start_app)
+          const tgStart = tg.initDataUnsafe?.start_param ?? tg.initDataUnsafe?.start_app ?? null;
+          referralFromTelegram = normalizeReferralParam(tgStart ?? null);
+        } catch (e) {
+          console.warn('Telegram init error (non-fatal):', e);
+        }
+      }
 
-        if (tgUser) {
-          const userId = String(tgUser.id);
-          const remoteUser = await api.getUser(userId);
+      // Also support direct URL ?start= or ?startapp=
+      const referralFromUrl = readReferralFromUrl();
+      const finalReferral = referralFromTelegram ?? referralFromUrl ?? null;
 
-          let currentUser: UserState;
-          if (remoteUser) {
-            currentUser = {
-              ...remoteUser,
-              id: userId,
-              username: tgUser.username || tgUser.first_name || 'CEO',
-              languageCode: tgUser.language_code || 'en'
-            };
-          } else {
-            currentUser = {
-              ...DEFAULT_GUEST,
-              id: userId,
-              username: tgUser.username || tgUser.first_name || 'CEO',
-              languageCode: tgUser.language_code || 'en',
-              referredBy: tg.initDataUnsafe?.start_param || null,
-            };
-            await api.saveUser(currentUser);
+      // Try to fetch Telegram user
+      const tgUser = tg?.initDataUnsafe?.user ?? null;
+
+      if (tgUser) {
+        const userId = String(tgUser.id);
+
+        // Try load existing user from Supabase/local cache
+        const remoteUser = await api.getUser(userId);
+
+        let currentUser: UserState;
+
+        if (remoteUser) {
+          // Existing user: merge updates from Telegram
+          currentUser = {
+            ...remoteUser,
+            id: userId,
+            username: tgUser.username || tgUser.first_name || remoteUser.username || 'CEO',
+            languageCode: tgUser.language_code || remoteUser.languageCode || 'en',
+          };
+        } else {
+          // NEW USER PATH (secure): call server endpoint to create user & process referral
+          currentUser = {
+            ...DEFAULT_GUEST,
+            id: userId,
+            username: tgUser.username || tgUser.first_name || 'CEO',
+            languageCode: tgUser.language_code || 'en',
+            referredBy: finalReferral,
+          };
+
+          try {
+            // POST to /api/register (server must verify initData and call handle_referral)
+            const resp = await fetch('/api/register', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: currentUser.id,
+                username: currentUser.username,
+                referredBy: currentUser.referredBy,
+                initData: tg?.initData ?? null,
+                languageCode: currentUser.languageCode,
+              }),
+            });
+
+            if (!resp.ok) {
+              // Log server error (server may still create user; we'll fetch authoritative record next)
+              const txt = await resp.text().catch(() => '');
+              console.warn('Server /api/register returned error:', resp.status, txt);
+            }
+          } catch (e) {
+            console.warn('Failed to call /api/register (continuing local):', e);
           }
 
-          setUser(currentUser);
-        } else {
-          console.warn("No Telegram user data found.");
+          // Fetch the authoritative user row (may include referral credits)
+          try {
+            const saved = await api.getUser(userId);
+            if (saved) {
+              currentUser = {
+                ...saved,
+                // ensure latest username/language from Telegram
+                username: tgUser.username || tgUser.first_name || saved.username,
+                languageCode: tgUser.language_code || saved.languageCode || 'en',
+              };
+            }
+          } catch (e) {
+            console.warn('Failed to fetch saved user after register:', e);
+          }
         }
+
+        setUser(currentUser);
       } else {
-        console.log("Running in browser mode");
+        // Not inside Telegram — treat as guest (optionally preserve referral from URL)
+        const guestWithReferral = { ...DEFAULT_GUEST, referredBy: finalReferral ?? DEFAULT_GUEST.referredBy };
+        setUser(guestWithReferral);
+        console.info('Running in browser mode. Referral (if any):', finalReferral);
       }
+
       setIsLoaded(true);
     };
 
@@ -78,7 +157,6 @@ const App: React.FC = () => {
 
   const isFirstRender = useRef(true);
 
-  // Persist user changes with debounce
   useEffect(() => {
     if (isFirstRender.current) {
       isFirstRender.current = false;
@@ -97,12 +175,12 @@ const App: React.FC = () => {
     const now = Date.now();
     if (now - user.lastMine < MINE_COOLDOWN_MS) return;
 
-    const earned = Math.floor(Math.random() * 1) + 1; // 2–3 coins
+    const earned = Math.floor(Math.random() * 2) + 2; // 2-3 coins
     const passive = calculatePassiveIncome(user.businesses);
     setUser(prev => ({
       ...prev,
       coins: prev.coins + earned + passive,
-      lastMine: now
+      lastMine: now,
     }));
   };
 
@@ -117,8 +195,8 @@ const App: React.FC = () => {
         coins: prev.coins - business.cost,
         businesses: {
           ...prev.businesses,
-          [businessId]: currentQty + 1
-        }
+          [businessId]: currentQty + 1,
+        },
       }));
     }
   };
